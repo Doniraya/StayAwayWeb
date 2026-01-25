@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Граф контейнеров и грузов</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+        }
+        #canvas-container {
+            position: relative;
+            border: 1px solid #ccc;
+            background-color: white;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        canvas {
+            display: block;
+        }
+        .tooltip {
+            position: absolute;
+            background-color: rgba(0,0,0,0.8);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 100;
+            display: none;
+            max-width: 200px;
+            word-wrap: break-word;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="graphCanvas"></canvas>
+        <div id="tooltip" class="tooltip"></div>
+    </div>
+
+    <script>
+        // Полифил для roundRect, если метод не поддерживается
+        if (!CanvasRenderingContext2D.prototype.roundRect) {
+            CanvasRenderingContext2D.prototype.roundRect = function(x, y, width, height, radius) {
+                if (typeof radius === 'number') {
+                    radius = {tl: radius, tr: radius, br: radius, bl: radius};
+                } else {
+                    const defaultRadius = {tl: 0, tr: 0, br: 0, bl: 0};
+                    radius = {...defaultRadius, ...radius};
+                }
+                
+                this.beginPath();
+                this.moveTo(x + radius.tl, y);
+                this.lineTo(x + width - radius.tr, y);
+                this.quadraticCurveTo(x + width, y, x + width, y + radius.tr);
+                this.lineTo(x + width, y + height - radius.br);
+                this.quadraticCurveTo(x + width, y + height, x + width - radius.br, y + height);
+                this.lineTo(x + radius.bl, y + height);
+                this.quadraticCurveTo(x, y + height, x, y + height - radius.bl);
+                this.lineTo(x, y + radius.tl);
+                this.quadraticCurveTo(x, y, x + radius.tl, y);
+                this.closePath();
+                return this;
+            };
+        }
+
+        // Класс для представления груза
+        class Good {
+            constructor(id, title, ref, weight, place, type = 'good') {
+                this.id = id;
+                this.title = title;
+                this.ref = ref;
+                this.weight = weight;
+                this.place = place;
+                this.type = type; // 'container_good', 'warehouse_good'
+                this.x = 0;
+                this.y = 0;
+                this.width = 60;
+                this.height = 60;
+                this.outgoing = [];
+                this.incoming = [];
+                this.containerId = null; // ID контейнера, если груз внутри контейнера
+                this.gridIndex = -1; // Позиция в сетке контейнера
+            }
+            
+            render(ctx, isContainerGood = false) {
+                // Основной прямоугольник груза
+                ctx.beginPath();
+                ctx.roundRect(this.x, this.y, this.width, this.height, 8);
+                
+                // Разные цвета для грузов в контейнере и на складе
+                if (isContainerGood) {
+                    ctx.fillStyle = '#fff3cd'; // Желтый для грузов в контейнере
+                } else {
+                    ctx.fillStyle = '#cce5ff'; // Голубой для грузов на складе
+                }
+                
+                ctx.fill();
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                
+                // Разделительные линии
+                ctx.beginPath();
+                ctx.moveTo(this.x, this.y + this.height/3);
+                ctx.lineTo(this.x + this.width, this.y + this.height/3);
+                ctx.moveTo(this.x, this.y + this.height*2/3);
+                ctx.lineTo(this.x + this.width, this.y + this.height*2/3);
+                ctx.strokeStyle = '#555';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                
+                // Текст
+                ctx.fillStyle = '#333';
+                ctx.font = '10px Arial';
+                ctx.textAlign = 'center';
+                
+                // Title с переносами
+                this.wrapText(ctx, this.title, this.x + this.width/2, this.y + this.height/6, this.width - 10, 10);
+                
+                // Place
+                ctx.fillText(this.place, this.x + this.width/2, this.y + this.height/2);
+                
+                // Weight
+                ctx.fillText(this.weight, this.x + this.width/2, this.y + this.height*5/6);
+            }
+            
+            wrapText(ctx, text, x, y, maxWidth, lineHeight) {
+                const words = text.split(' ');
+                let line = '';
+                let currentY = y;
+                
+                for (let i = 0; i < words.length; i++) {
+                    const testLine = line + words[i] + ' ';
+                    const metrics = ctx.measureText(testLine);
+                    const testWidth = metrics.width;
+                    
+                    if (testWidth > maxWidth && i > 0) {
+                        ctx.fillText(line, x, currentY);
+                        line = words[i] + ' ';
+                        currentY += lineHeight;
+                    } else {
+                        line = testLine;
+                    }
+                }
+                
+                ctx.fillText(line, x, currentY);
+            }
+            
+            getConnectorPoint(targetNode, isEnd = false) {
+                const centerX = this.x + this.width / 2;
+                const centerY = this.y + this.height / 2;
+                const targetCenterX = targetNode.x + targetNode.width / 2;
+                const targetCenterY = targetNode.y + targetNode.height / 2;
+                
+                const dx = targetCenterX - centerX;
+                const dy = targetCenterY - centerY;
+                const length = Math.sqrt(dx * dx + dy * dy);
+                if (length === 0) return { x: centerX, y: centerY };
+                
+                const normDx = dx / length;
+                const normDy = dy / length;
+                
+                let edgeX, edgeY;
+                
+                // Проверяем пересечение с каждой стороной прямоугольника
+                if (normDx < 0) {
+                    const t = (this.x - centerX) / normDx;
+                    const intersectY = centerY + t * normDy;
+                    if (intersectY >= this.y && intersectY <= this.y + this.height) {
+                        edgeX = this.x;
+                        edgeY = intersectY;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                if (normDx > 0) {
+                    const t = (this.x + this.width - centerX) / normDx;
+                    const intersectY = centerY + t * normDy;
+                    if (intersectY >= this.y && intersectY <= this.y + this.height) {
+                        edgeX = this.x + this.width;
+                        edgeY = intersectY;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                if (normDy < 0) {
+                    const t = (this.y - centerY) / normDy;
+                    const intersectX = centerX + t * normDx;
+                    if (intersectX >= this.x && intersectX <= this.x + this.width) {
+                        edgeX = intersectX;
+                        edgeY = this.y;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                if (normDy > 0) {
+                    const t = (this.y + this.height - centerY) / normDy;
+                    const intersectX = centerX + t * normDx;
+                    if (intersectX >= this.x && intersectX <= this.x + this.width) {
+                        edgeX = intersectX;
+                        edgeY = this.y + this.height;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                return { x: centerX, y: centerY };
+            }
+            
+            // Проверка, пересекается ли точка с этим объектом
+            intersectsPoint(px, py) {
+                return px >= this.x && px <= this.x + this.width && 
+                       py >= this.y && py <= this.y + this.height;
+            }
+            
+            // Проверка, пересекается ли линия с этим объектом
+            intersectsLine(x1, y1, x2, y2) {
+                // Простая проверка: если оба конца линии вне прямоугольника и линия не пересекает стороны
+                // Проверяем пересечение с каждой стороной прямоугольника
+                const rectLines = [
+                    {x1: this.x, y1: this.y, x2: this.x + this.width, y2: this.y}, // верх
+                    {x1: this.x + this.width, y1: this.y, x2: this.x + this.width, y2: this.y + this.height}, // правая
+                    {x1: this.x, y1: this.y + this.height, x2: this.x + this.width, y2: this.y + this.height}, // низ
+                    {x1: this.x, y1: this.y, x2: this.x, y2: this.y + this.height} // левая
+                ];
+                
+                for (let i = 0; i < rectLines.length; i++) {
+                    if (this.lineIntersectsLine(x1, y1, x2, y2, 
+                        rectLines[i].x1, rectLines[i].y1, 
+                        rectLines[i].x2, rectLines[i].y2)) {
+                        return true;
+                    }
+                }
+                
+                // Проверяем, не находится ли один из концов линии внутри прямоугольника
+                if (this.intersectsPoint(x1, y1) || this.intersectsPoint(x2, y2)) {
+                    return true;
+                }
+                
+                return false;
+            }
+            
+            lineIntersectsLine(x1, y1, x2, y2, x3, y3, x4, y4) {
+                // Проверка пересечения двух отрезков
+                const denominator = (y4 - y3) * (x2 - x1) - (x4 - x3) * (y2 - y1);
+                if (denominator === 0) return false;
+                
+                const ua = ((x4 - x3) * (y1 - y3) - (y4 - y3) * (x1 - x3)) / denominator;
+                const ub = ((x2 - x1) * (y1 - y3) - (y2 - y1) * (x1 - x3)) / denominator;
+                
+                return ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1;
+            }
+        }
+        
+        // Класс для представления контейнера
+        class Container {
+            constructor(id, title, isotype, weight, place, ref) {
+                this.id = id;
+                this.title = title;
+                this.isotype = isotype;
+                this.weight = weight;
+                this.place = place;
+                this.ref = ref;
+                this.goods = []; // Массив грузов внутри контейнера
+                this.x = 0;
+                this.y = 0;
+                this.width = 300;
+                this.height = 200;
+                this.headerHeight = 40;
+                this.containerPadding = 10;
+                this.outgoing = [];
+                this.incoming = [];
+                this.gridCols = 3;
+                this.gridRows = 2;
+            }
+            
+            addGood(good) {
+                this.goods.push(good);
+                good.containerId = this.id;
+                good.gridIndex = this.goods.length - 1;
+            }
+            
+            layoutGoods() {
+                if (this.goods.length === 0) return;
+                
+                const gridWidth = this.width - 2 * this.containerPadding;
+                const gridHeight = this.height - this.headerHeight - 2 * this.containerPadding;
+                const cellWidth = (gridWidth - (this.gridCols - 1) * 8) / this.gridCols;
+                const cellHeight = (gridHeight - (this.gridRows - 1) * 8) / this.gridRows;
+                
+                this.goods.forEach((good, index) => {
+                    const col = index % this.gridCols;
+                    const row = Math.floor(index / this.gridCols);
+                    
+                    good.x = this.x + this.containerPadding + col * (cellWidth + 8);
+                    good.y = this.y + this.headerHeight + this.containerPadding + row * (cellHeight + 8);
+                    good.width = cellWidth;
+                    good.height = cellHeight;
+                });
+            }
+            
+            render(ctx) {
+                // Основной прямоугольник контейнера с явным указанием скругления углов
+                ctx.beginPath();
+                ctx.roundRect(this.x, this.y, this.width, this.height, 12);
+                ctx.fillStyle = '#f8f8f8';
+                ctx.fill();
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Шапка контейнера с явным скруглением верхних углов
+                ctx.beginPath();
+                ctx.roundRect(this.x, this.y, this.width, this.headerHeight, {tl: 12, tr: 12, br: 0, bl: 0});
+                ctx.fillStyle = '#e8e8e8';
+                ctx.fill();
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Разделительные линии в шапке
+                const col1Width = this.width * 0.2;
+                const col2Width = this.width * 0.5;
+                const col3Width = this.width * 0.3;
+                
+                // Вертикальная линия между колонками 2 и 3
+                ctx.beginPath();
+                ctx.moveTo(this.x + col1Width + col2Width, this.y);
+                ctx.lineTo(this.x + col1Width + col2Width, this.y + this.headerHeight);
+                ctx.strokeStyle = '#555';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Горизонтальная линия, разделяющая place и weight в третьей колонке
+                ctx.beginPath();
+                ctx.moveTo(this.x + col1Width + col2Width, this.y + this.headerHeight/2);
+                ctx.lineTo(this.x + this.width, this.y + this.headerHeight/2);
+                ctx.strokeStyle = '#555';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Горизонтальная линия внизу шапки
+                ctx.beginPath();
+                ctx.moveTo(this.x, this.y + this.headerHeight);
+                ctx.lineTo(this.x + this.width, this.y + this.headerHeight);
+                ctx.strokeStyle = '#555';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                // Текст в шапке
+                ctx.fillStyle = '#333';
+                
+                // Первая колонка (isotype)
+                ctx.font = 'bold 16px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                const isotype = this.isotype || "N/A";
+                ctx.fillText(isotype, this.x + col1Width/2, this.y + this.headerHeight/2);
+                
+                // Вторая колонка (title)
+                ctx.fillText(this.title || "Без названия", this.x + col1Width + col2Width/2, this.y + this.headerHeight/2);
+                
+                // Третья колонка (place и weight)
+                ctx.font = 'bold 12px Arial';
+                ctx.fillText(this.place || "N/A", this.x + col1Width + col2Width + col3Width/2, this.y + this.headerHeight/4);
+                ctx.fillText(this.weight || "N/A", this.x + col1Width + col2Width + col3Width/2, this.y + this.headerHeight*3/4);
+            }
+            
+            getConnectorPoint(targetNode, isEnd = false) {
+                const centerX = this.x + this.width / 2;
+                const centerY = this.y + this.height / 2;
+                const targetCenterX = targetNode.x + targetNode.width / 2;
+                const targetCenterY = targetNode.y + targetNode.height / 2;
+                
+                const dx = targetCenterX - centerX;
+                const dy = targetCenterY - centerY;
+                const length = Math.sqrt(dx * dx + dy * dy);
+                if (length === 0) return { x: centerX, y: centerY };
+                
+                const normDx = dx / length;
+                const normDy = dy / length;
+                
+                let edgeX, edgeY;
+                
+                if (normDx < 0) {
+                    const t = (this.x - centerX) / normDx;
+                    const intersectY = centerY + t * normDy;
+                    if (intersectY >= this.y && intersectY <= this.y + this.height) {
+                        edgeX = this.x;
+                        edgeY = intersectY;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                if (normDx > 0) {
+                    const t = (this.x + this.width - centerX) / normDx;
+                    const intersectY = centerY + t * normDy;
+                    if (intersectY >= this.y && intersectY <= this.y + this.height) {
+                        edgeX = this.x + this.width;
+                        edgeY = intersectY;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                if (normDy < 0) {
+                    const t = (this.y - centerY) / normDy;
+                    const intersectX = centerX + t * normDx;
+                    if (intersectX >= this.x && intersectX <= this.x + this.width) {
+                        edgeX = intersectX;
+                        edgeY = this.y;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                if (normDy > 0) {
+                    const t = (this.y + this.height - centerY) / normDy;
+                    const intersectX = centerX + t * normDx;
+                    if (intersectX >= this.x && intersectX <= this.x + this.width) {
+                        edgeX = intersectX;
+                        edgeY = this.y + this.height;
+                        return { x: edgeX, y: edgeY };
+                    }
+                }
+                
+                return { x: centerX, y: centerY };
+            }
+            
+            // Проверка, пересекается ли точка с этим объектом
+            intersectsPoint(px, py) {
+                return px >= this.x && px <= this.x + this.width && 
+                       py >= this.y && py <= this.y + this.height;
+            }
+            
+            // Проверка, пересекается ли линия с этим объектом
+            intersectsLine(x1, y1, x2, y2) {
+                // Простая проверка: если оба конца линии вне прямоугольника и линия не пересекает стороны
+                // Проверяем пересечение с каждой стороной прямоугольника
+                const rectLines = [
+                    {x1: this.x, y1: this.y, x2: this.x + this.width, y2: this.y}, // верх
+                    {x1: this.x + this.width, y1: this.y, x2: this.x + this.width, y2: this.y + this.height}, // правая
+                    {x1: this.x, y1: this.y + this.height, x2: this.x + this.width, y2: this.y + this.height}, // низ
+                    {x1: this.x, y1: this.y, x2: this.x, y2: this.y + this.height} // левая
+                ];
+                
+                for (let i = 0; i < rectLines.length; i++) {
+                    if (this.lineIntersectsLine(x1, y1, x2, y2, 
+                        rectLines[i].x1, rectLines[i].y1, 
+                        rectLines[i].x2, rectLines[i].y2)) {
+                        return true;
+                    }
+                }
+                
+                // Проверяем, не находится ли один из концов линии внутри прямоугольника
+                if (this.intersectsPoint(x1, y1) || this.intersectsPoint(x2, y2)) {
+                    return true;
+                }
+                
+                return false;
+            }
+            
+            lineIntersectsLine(x1, y1, x2, y2, x3, y3, x4, y4) {
+                // Проверка пересечения двух отрезков
+                const denominator = (y4 - y3) * (x2 - x1) - (x4 - x3) * (y2 - y1);
+                if (denominator === 0) return false;
+                
+                const ua = ((x4 - x3) * (y1 - y3) - (y4 - y3) * (x1 - x3)) / denominator;
+                const ub = ((x2 - x1) * (y1 - y3) - (y2 - y1) * (x1 - x3)) / denominator;
+                
+                return ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1;
+            }
+        }
+        
+        // Алгоритм Дейкстры для поиска пути обхода препятствий
+        class PathFinder {
+            constructor(objects) {
+                this.objects = objects; // Все объекты, которые нужно обойти
+                this.gridSize = 5; // Размер ячейки сетки для поиска пути
+            }
+            
+            // Создаем сетку вокруг объектов
+            createGrid() {
+                // Находим границы всех объектов
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                
+                this.objects.forEach(obj => {
+                    minX = Math.min(minX, obj.x - 50);
+                    minY = Math.min(minY, obj.y - 50);
+                    maxX = Math.max(maxX, obj.x + obj.width + 50);
+                    maxY = Math.max(maxY, obj.y + obj.height + 50);
+                });
+                
+                // Создаем сетку
+                const gridWidth = Math.ceil((maxX - minX) / this.gridSize);
+                const gridHeight = Math.ceil((maxY - minY) / this.gridSize);
+                
+                const grid = [];
+                for (let y = 0; y < gridHeight; y++) {
+                    grid[y] = [];
+                    for (let x = 0; x < gridWidth; x++) {
+                        grid[y][x] = {
+                            x: minX + x * this.gridSize,
+                            y: minY + y * this.gridSize,
+                            cost: 1,
+                            visited: false,
+                            distance: Infinity,
+                            previous: null,
+                            isObstacle: false
+                        };
+                    }
+                }
+                
+                // Помечаем ячейки, которые пересекаются с объектами, как препятствия
+                for (let y = 0; y < gridHeight; y++) {
+                    for (let x = 0; x < gridWidth; x++) {
+                        const cell = grid[y][x];
+                        const cellCenterX = cell.x + this.gridSize / 2;
+                        const cellCenterY = cell.y + this.gridSize / 2;
+                        
+                        // Проверяем, пересекается ли ячейка с каким-либо объектом
+                        for (let i = 0; i < this.objects.length; i++) {
+                            const obj = this.objects[i];
+                            if (obj.intersectsPoint(cellCenterX, cellCenterY)) {
+                                cell.isObstacle = true;
+                                cell.cost = Infinity;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                return {
+                    grid: grid,
+                    width: gridWidth,
+                    height: gridHeight,
+                    minX: minX,
+                    minY: minY
+                };
+            }
+            
+            // Получаем соседей ячейки
+            getNeighbors(gridInfo, x, y) {
+                const neighbors = [];
+                const directions = [
+                    {dx: -1, dy: 0}, {dx: 1, dy: 0}, // лево, право
+                    {dx: 0, dy: -1}, {dx: 0, dy: 1}, // верх, низ
+                    {dx: -1, dy: -1}, {dx: 1, dy: -1}, // диагонали
+                    {dx: -1, dy: 1}, {dx: 1, dy: 1}
+                ];
+                
+                for (let i = 0; i < directions.length; i++) {
+                    const nx = x + directions[i].dx;
+                    const ny = y + directions[i].dy;
+                    
+                    if (nx >= 0 && nx < gridInfo.width && ny >= 0 && ny < gridInfo.height) {
+                        if (!gridInfo.grid[ny][nx].isObstacle) {
+                            neighbors.push({x: nx, y: ny});
+                        }
+                    }
+                }
+                
+                return neighbors;
+            }
+            
+            // Расстояние между двумя точками
+            distance(x1, y1, x2, y2) {
+                return Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+            }
+            
+            // Находим ячейку сетки, ближайшую к точке
+            getGridCell(gridInfo, px, py) {
+                const gridX = Math.floor((px - gridInfo.minX) / this.gridSize);
+                const gridY = Math.floor((py - gridInfo.minY) / this.gridSize);
+                
+                // Ограничиваем значения
+                return {
+                    x: Math.max(0, Math.min(gridInfo.width - 1, gridX)),
+                    y: Math.max(0, Math.min(gridInfo.height - 1, gridY))
+                };
+            }
+            
+            // Поиск пути с использованием алгоритма Дейкстры
+            findPath(startX, startY, endX, endY) {
+                const gridInfo = this.createGrid();
+                
+                // Находим начальную и конечную ячейки
+                const startCell = this.getGridCell(gridInfo, startX, startY);
+                const endCell = this.getGridCell(gridInfo, endX, endY);
+                
+                // Если начальная или конечная ячейка - препятствие, используем ближайшие свободные ячейки
+                if (gridInfo.grid[startCell.y][startCell.x].isObstacle) {
+                    // Ищем ближайшую свободную ячейку
+                    let found = false;
+                    for (let d = 1; d < 10 && !found; d++) {
+                        for (let dx = -d; dx <= d && !found; dx++) {
+                            for (let dy = -d; dy <= d && !found; dy++) {
+                                const nx = startCell.x + dx;
+                                const ny = startCell.y + dy;
+                                if (nx >= 0 && nx < gridInfo.width && ny >= 0 && ny < gridInfo.height) {
+                                    if (!gridInfo.grid[ny][nx].isObstacle) {
+                                        startCell.x = nx;
+                                        startCell.y = ny;
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (gridInfo.grid[endCell.y][endCell.x].isObstacle) {
+                    let found = false;
+                    for (let d = 1; d < 10 && !found; d++) {
+                        for (let dx = -d; dx <= d && !found; dx++) {
+                            for (let dy = -d; dy <= d && !found; dy++) {
+                                const nx = endCell.x + dx;
+                                const ny = endCell.y + dy;
+                                if (nx >= 0 && nx < gridInfo.width && ny >= 0 && ny < gridInfo.height) {
+                                    if (!gridInfo.grid[ny][nx].isObstacle) {
+                                        endCell.x = nx;
+                                        endCell.y = ny;
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Инициализация
+                const pq = []; // Приоритетная очередь
+                gridInfo.grid[startCell.y][startCell.x].distance = 0;
+                pq.push({x: startCell.x, y: startCell.y, distance: 0});
+                
+                while (pq.length > 0) {
+                    // Находим ячейку с минимальным расстоянием
+                    pq.sort((a, b) => a.distance - b.distance);
+                    const current = pq.shift();
+                    
+                    const cell = gridInfo.grid[current.y][current.x];
+                    if (cell.visited) continue;
+                    cell.visited = true;
+                    
+                    // Если достигли цели
+                    if (current.x === endCell.x && current.y === endCell.y) {
+                        break;
+                    }
+                    
+                    // Проверяем соседей
+                    const neighbors = this.getNeighbors(gridInfo, current.x, current.y);
+                    for (let i = 0; i < neighbors.length; i++) {
+                        const neighbor = neighbors[i];
+                        const nCell = gridInfo.grid[neighbor.y][neighbor.x];
+                        
+                        if (nCell.visited) continue;
+                        
+                        const newDistance = cell.distance + this.distance(
+                            cell.x, cell.y, nCell.x, nCell.y
+                        );
+                        
+                        if (newDistance < nCell.distance) {
+                            nCell.distance = newDistance;
+                            nCell.previous = {x: current.x, y: current.y};
+                            pq.push({x: neighbor.x, y: neighbor.y, distance: newDistance});
+                        }
+                    }
+                }
+                
+                // Восстанавливаем путь
+                const path = [];
+                let current = endCell;
+                
+                while (current) {
+                    const cell = gridInfo.grid[current.y][current.x];
+                    path.unshift({
+                        x: cell.x + this.gridSize / 2,
+                        y: cell.y + this.gridSize / 2
+                    });
+                    
+                    if (cell.previous) {
+                        current = cell.previous;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Если путь не найден, возвращаем прямую линию
+                if (path.length <= 1) {
+                    return [
+                        {x: startX, y: startY},
+                        {x: endX, y: endY}
+                    ];
+                }
+                
+                // Добавляем начальную и конечную точки для точности
+                if (path.length > 0) {
+                    const firstPoint = path[0];
+                    const lastPoint = path[path.length - 1];
+                    
+                    // Проверяем, что первая точка не совпадает с начальной
+                    if (this.distance(firstPoint.x, firstPoint.y, startX, startY) > 5) {
+                        path.unshift({x: startX, y: startY});
+                    }
+                    
+                    // Проверяем, что последняя точка не совпадает с конечной
+                    if (this.distance(lastPoint.x, lastPoint.y, endX, endY) > 5) {
+                        path.push({x: endX, y: endY});
+                    }
+                }
+                
+                return path;
+            }
+            
+            // Упрощаем путь, удаляя лишние точки
+            simplifyPath(path, tolerance = 2) {
+                if (path.length <= 2) return path;
+                
+                const simplified = [path[0]];
+                
+                for (let i = 1; i < path.length - 1; i++) {
+                    const prev = simplified[simplified.length - 1];
+                    const current = path[i];
+                    const next = path[i + 1];
+                    
+                    // Проверяем, можно ли удалить текущую точку
+                    // (если линия от предыдущей до следующей не пересекает препятствия)
+                    let canRemove = true;
+                    
+                    for (let j = 0; j < this.objects.length; j++) {
+                        if (this.objects[j].intersectsLine(prev.x, prev.y, next.x, next.y)) {
+                            canRemove = false;
+                            break;
+                        }
+                    }
+                    
+                    if (!canRemove || this.pointToLineDistance(current.x, current.y, prev.x, prev.y, next.x, next.y) > tolerance) {
+                        simplified.push(current);
+                    }
+                }
+                
+                simplified.push(path[path.length - 1]);
+                return simplified;
+            }
+            
+            // Расстояние от точки до линии
+            pointToLineDistance(px, py, x1, y1, x2, y2) {
+                const A = px - x1;
+                const B = py - y1;
+                const C = x2 - x1;
+                const D = y2 - y1;
+                
+                const dot = A * C + B * D;
+                const lenSq = C * C + D * D;
+                let param = -1;
+                if (lenSq !== 0) param = dot / lenSq;
+                
+                let xx, yy;
+                
+                if (param < 0) {
+                    xx = x1;
+                    yy = y1;
+                } else if (param > 1) {
+                    xx = x2;
+                    yy = y2;
+                } else {
+                    xx = x1 + param * C;
+                    yy = y1 + param * D;
+                }
+                
+                const dx = px - xx;
+                const dy = py - yy;
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+        }
+        
+        // Основной класс визуализатора графа
+        class GraphVisualizer {
+            constructor(canvasId) {
+                this.canvas = document.getElementById(canvasId);
+                this.ctx = this.canvas.getContext('2d');
+                this.tooltip = document.getElementById('tooltip');
+                
+                // Настройки отображения
+                this.containerWidth = 300;
+                this.containerHeight = 200;
+                this.goodsSize = 60;
+                this.goodsMargin = 8;
+                
+                // Параметры для навигации
+                this.offsetX = 0;
+                this.offsetY = 0;
+                this.scale = 1;
+                this.isDragging = false;
+                this.lastMouseX = 0;
+                this.lastMouseY = 0;
+                
+                // Данные
+                this.containers = [];
+                this.warehouseGoods = [];
+                this.joins = [];
+                this.allNodes = []; // Все узлы для отрисовки и обработки событий
+                this.nodeMap = {}; // Карта ID -> узел
+                
+                this.initCanvasSize();
+                this.setupEventListeners();
+            }
+            
+            initCanvasSize() {
+                this.canvas.width = window.innerWidth - 40;
+                this.canvas.height = window.innerHeight - 40;
+            }
+            
+            setupEventListeners() {
+                this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+                this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+                this.canvas.addEventListener('mouseup', () => this.handleMouseUp());
+                this.canvas.addEventListener('wheel', (e) => this.handleWheel(e));
+                this.canvas.addEventListener('click', (e) => this.handleClick(e));
+                this.canvas.addEventListener('mouseover', (e) => this.showTooltip(e));
+                this.canvas.addEventListener('mouseout', () => this.hideTooltip());
+                window.addEventListener('resize', () => this.initCanvasSize());
+            }
+            
+            setData(data) {
+                this.containers = [];
+                this.warehouseGoods = [];
+                this.joins = data.joins || [];
+                this.allNodes = [];
+                this.nodeMap = {};
+                
+                // Создаем контейнеры
+                if (data.containers) {
+                    data.containers.forEach(containerData => {
+                        const container = new Container(
+                            containerData.id,
+                            containerData.title,
+                            containerData.isotype,
+                            containerData.weight,
+                            containerData.place,
+                            containerData.ref
+                        );
+                        
+                        // Добавляем грузы в контейнер
+                        if (containerData.goods) {
+                            containerData.goods.forEach(goodData => {
+                                const good = new Good(
+                                    goodData.id,
+                                    goodData.title,
+                                    goodData.ref,
+                                    goodData.weight,
+                                    goodData.place,
+                                    'container_good'
+                                );
+                                container.addGood(good);
+                                this.nodeMap[good.id] = good;
+                                this.allNodes.push(good);
+                            });
+                        }
+                        
+                        this.containers.push(container);
+                        this.nodeMap[container.id] = container;
+                        this.allNodes.push(container);
+                    });
+                }
+                
+                // Создаем грузы на складе
+                if (data.goods) {
+                    data.goods.forEach(goodData => {
+                        const good = new Good(
+                            goodData.id,
+                            goodData.title,
+                            goodData.ref,
+                            goodData.weight,
+                            goodData.place,
+                            'warehouse_good'
+                        );
+                        this.warehouseGoods.push(good);
+                        this.nodeMap[good.id] = good;
+                        this.allNodes.push(good);
+                    });
+                }
+                
+                // Обработка соединений
+                this.joins.forEach(join => {
+                    if (this.nodeMap[join.from] && this.nodeMap[join.to]) {
+                        this.nodeMap[join.from].outgoing.push({
+                            to: join.to,
+                            text: join.text,
+                            fromNode: this.nodeMap[join.from],
+                            toNode: this.nodeMap[join.to]
+                        });
+                        this.nodeMap[join.to].incoming.push({
+                            from: join.from,
+                            text: join.text,
+                            fromNode: this.nodeMap[join.from],
+                            toNode: this.nodeMap[join.to]
+                        });
+                    }
+                });
+                
+                this.layoutGraph();
+                this.render();
+            }
+            
+            calculateNodeLevel(node) {
+                if (node.incoming.length === 0) return 0;
+                if (node.outgoing.length === 0) return 2;
+                return 1;
+            }
+            
+            layoutGraph() {
+                // Устанавливаем уровень для каждого узла
+                this.allNodes.forEach(node => {
+                    node.level = this.calculateNodeLevel(node);
+                });
+                
+                // Сортируем узлы по уровням
+                this.allNodes.sort((a, b) => a.level - b.level);
+                
+                // Группируем узлы по уровням
+                const levels = {};
+                this.allNodes.forEach(node => {
+                    if (!levels[node.level]) levels[node.level] = [];
+                    levels[node.level].push(node);
+                });
+                
+                // Сортируем контейнеры в каждом уровне по количеству исходящих связей
+                Object.keys(levels).forEach(level => {
+                    levels[level].sort((a, b) => {
+                        if (a instanceof Container && b instanceof Container) {
+                            return b.outgoing.length - a.outgoing.length;
+                        }
+                        return 0;
+                    });
+                });
+                
+                // Располагаем узлы
+                const levelKeys = Object.keys(levels).sort((a, b) => parseInt(a) - parseInt(b));
+                const horizontalSpacing = 100;
+                const verticalSpacing = 300;
+                
+                let currentY = 50;
+                
+                for (let i = 0; i < levelKeys.length; i++) {
+                    const level = levelKeys[i];
+                    const nodesInLevel = levels[level];
+                    
+                    // Разделяем контейнеры и складские грузы
+                    const containersInLevel = nodesInLevel.filter(node => node instanceof Container);
+                    const warehouseGoods = nodesInLevel.filter(node => node instanceof Good && node.type === 'warehouse_good');
+                    
+                    if (containersInLevel.length > 0) {
+                        // Рассчитываем общую ширину контейнеров для центрирования
+                        const totalWidth = containersInLevel.length * (this.containerWidth + horizontalSpacing) - horizontalSpacing;
+                        const startX = (this.canvas.width / this.scale - totalWidth) / 2;
+                        
+                        // Располагаем контейнеры
+                        containersInLevel.forEach((container, index) => {
+                            container.x = startX + index * (this.containerWidth + horizontalSpacing);
+                            container.y = currentY;
+                            
+                            // Располагаем грузы внутри контейнера
+                            container.layoutGoods();
+                        });
+                        
+                        // Если есть складские грузы, располагаем их справа от последнего контейнера
+                        if (warehouseGoods.length > 0 && containersInLevel.length > 0) {
+                            const lastContainer = containersInLevel[containersInLevel.length - 1];
+                            this.layoutWarehouseGoodsRightOfContainer(warehouseGoods, lastContainer);
+                        } else if (warehouseGoods.length > 0) {
+                            this.layoutWarehouseGoods(warehouseGoods, currentY);
+                        }
+                    } else if (warehouseGoods.length > 0) {
+                        this.layoutWarehouseGoods(warehouseGoods, currentY);
+                    }
+                    
+                    currentY += verticalSpacing;
+                }
+            }
+            
+            layoutWarehouseGoodsRightOfContainer(warehouseGoods, container) {
+                const gridCols = Math.min(2, warehouseGoods.length);
+                const gridRows = Math.ceil(warehouseGoods.length / gridCols);
+                
+                const startX = container.x + this.containerWidth + 40;
+                const startY = container.y;
+                
+                warehouseGoods.forEach((good, index) => {
+                    const col = index % gridCols;
+                    const row = Math.floor(index / gridCols);
+                    
+                    good.x = startX + col * (this.goodsSize + this.goodsMargin);
+                    good.y = startY + row * (this.goodsSize + this.goodsMargin);
+                });
+            }
+            
+            layoutWarehouseGoods(warehouseGoods, startY) {
+                const gridCols = Math.min(3, warehouseGoods.length);
+                const gridRows = Math.ceil(warehouseGoods.length / gridCols);
+                
+                const groupWidth = gridCols * (this.goodsSize + this.goodsMargin) - this.goodsMargin;
+                const groupHeight = gridRows * (this.goodsSize + this.goodsMargin) - this.goodsMargin;
+                
+                const startX = (this.canvas.width / this.scale - groupWidth) / 2;
+                
+                warehouseGoods.forEach((good, index) => {
+                    const col = index % gridCols;
+                    const row = Math.floor(index / gridCols);
+                    
+                    good.x = startX + col * (this.goodsSize + this.goodsMargin);
+                    good.y = startY + row * (this.goodsSize + this.goodsMargin);
+                });
+            }
+            
+            render() {
+                this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+                
+                this.ctx.save();
+                this.ctx.translate(this.offsetX, this.offsetY);
+                this.ctx.scale(this.scale, this.scale);
+                
+                // Отрисовываем все объекты (контейнеры и грузы)
+                this.renderObjects();
+                
+                // Отрисовываем соединения ПОСЛЕ всех объектов (на переднем плане)
+                this.renderJoins();
+                
+                this.ctx.restore();
+            }
+            
+            renderObjects() {
+                // Отрисовываем контейнеры
+                this.containers.forEach(container => {
+                    container.render(this.ctx);
+                });
+                
+                // Отрисовываем грузы на складе
+                this.warehouseGoods.forEach(good => {
+                    good.render(this.ctx, false);
+                });
+                
+                // Отрисовываем грузы внутри контейнеров
+                this.containers.forEach(container => {
+                    container.goods.forEach(good => {
+                        good.render(this.ctx, true);
+                    });
+                });
+            }
+            
+            renderJoins() {
+                // Сохраняем текущее состояние контекста
+                this.ctx.save();
+                
+                // Создаем экземпляр PathFinder с текущими объектами
+                const pathFinder = new PathFinder(this.allNodes);
+                
+                // Устанавливаем параметры для линий
+                this.ctx.lineWidth = 3;
+                this.ctx.lineCap = 'round';
+                this.ctx.lineJoin = 'round';
+                
+                // Рисуем каждое соединение
+                this.joins.forEach(join => {
+                    if (!this.nodeMap[join.from] || !this.nodeMap[join.to]) return;
+                    
+                    const fromNode = this.nodeMap[join.from];
+                    const toNode = this.nodeMap[join.to];
+                    
+                    // Получаем точки соединения
+                    const fromPoint = fromNode.getConnectorPoint(toNode);
+                    const toPoint = toNode.getConnectorPoint(fromNode, true);
+                    
+                    // Используем алгоритм Дейкстры для поиска пути обхода препятствий
+                    const path = pathFinder.findPath(fromPoint.x, fromPoint.y, toPoint.x, toPoint.y);
+                    const simplifiedPath = pathFinder.simplifyPath(path);
+                    
+                    // Рисуем линию по найденному пути
+                    this.drawPathWithCurves(simplifiedPath, join.text);
+                });
+                
+                // Восстанавливаем состояние контекста
+                this.ctx.restore();
+            }
+            
+            drawPathWithCurves(path, text) {
+                if (path.length < 2) return;
+                
+                // Добавляем тень для лучшей видимости
+                this.ctx.shadowColor = 'rgba(0,0,0,0.3)';
+                this.ctx.shadowBlur = 4;
+                this.ctx.shadowOffsetX = 0;
+                this.ctx.shadowOffsetY = 2;
+                
+                // Начинаем путь
+                this.ctx.beginPath();
+                this.ctx.moveTo(path[0].x, path[0].y);
+                
+                // Рисуем кривые между точками
+                for (let i = 1; i < path.length; i++) {
+                    if (i === 1) {
+                        this.ctx.lineTo(path[i].x, path[i].y);
+                    } else {
+                        // Используем кривые Безье для плавных переходов
+                        const prev = path[i-2];
+                        const curr = path[i-1];
+                        const next = path[i];
+                        
+                        // Контрольные точки для плавной кривой
+                        const cp1x = curr.x;
+                        const cp1y = curr.y;
+                        const cp2x = curr.x + (next.x - prev.x) * 0.1;
+                        const cp2y = curr.y + (next.y - prev.y) * 0.1;
+                        
+                        this.ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, next.x, next.y);
+                    }
+                }
+                
+                // Устанавливаем стиль линии
+                this.ctx.strokeStyle = '#FF5722'; // Яркий оранжевый цвет
+                this.ctx.lineWidth = 3;
+                this.ctx.stroke();
+                
+                // Отключаем тень для стрелки и текста
+                this.ctx.shadowColor = 'transparent';
+                this.ctx.shadowBlur = 0;
+                
+                // Рисуем стрелку на конце
+                if (path.length >= 2) {
+                    const lastPoint = path[path.length - 1];
+                    const prevPoint = path[path.length - 2];
+                    this.drawArrowHead(lastPoint.x, lastPoint.y, prevPoint.x, prevPoint.y);
+                }
+                
+                // Находим середину пути для текста
+                let totalLength = 0;
+                let segments = [];
+                
+                for (let i = 1; i < path.length; i++) {
+                    const segmentLength = Math.sqrt(
+                        Math.pow(path[i].x - path[i-1].x, 2) + 
+                        Math.pow(path[i].y - path[i-1].y, 2)
+                    );
+                    segments.push({
+                        start: path[i-1],
+                        end: path[i],
+                        length: segmentLength
+                    });
+                    totalLength += segmentLength;
+                }
+                
+                const midLength = totalLength / 2;
+                let currentLength = 0;
+                let midPoint = {x: path[0].x, y: path[0].y};
+                
+                for (let i = 0; i < segments.length; i++) {
+                    if (currentLength + segments[i].length >= midLength) {
+                        const ratio = (midLength - currentLength) / segments[i].length;
+                        midPoint = {
+                            x: segments[i].start.x + ratio * (segments[i].end.x - segments[i].start.x),
+                            y: segments[i].start.y + ratio * (segments[i].end.y - segments[i].start.y)
+                        };
+                        break;
+                    }
+                    currentLength += segments[i].length;
+                }
+                
+                // Рисуем текст посередине кривой
+                this.ctx.fillStyle = '#333';
+                this.ctx.font = 'bold 12px Arial';
+                this.ctx.textAlign = 'center';
+                this.ctx.textBaseline = 'middle';
+                
+                // Размеры прямоугольника с текстом
+                const textWidth = this.ctx.measureText(text).width + 12;
+                const textHeight = 22;
+                
+                // Фон для текста
+                this.ctx.fillStyle = 'white';
+                this.ctx.strokeStyle = '#FF5722';
+                this.ctx.lineWidth = 2;
+                this.ctx.fillRect(midPoint.x - textWidth/2, midPoint.y - textHeight/2, textWidth, textHeight);
+                this.ctx.strokeRect(midPoint.x - textWidth/2, midPoint.y - textHeight/2, textWidth, textHeight);
+                
+                // Текст
+                this.ctx.fillStyle = '#333';
+                this.ctx.fillText(text, midPoint.x, midPoint.y);
+            }
+            
+            drawArrowHead(x, y, fromX, fromY) {
+                // Вектор от предыдущей точки к текущей
+                const dx = x - fromX;
+                const dy = y - fromY;
+                const length = Math.sqrt(dx * dx + dy * dy);
+                
+                // Если длина слишком мала, не рисуем стрелку
+                if (length < 1) return;
+                
+                // Нормализуем вектор
+                const normDx = dx / length;
+                const normDy = dy / length;
+                
+                // Длина и ширина стрелки
+                const arrowLength = 12;
+                const arrowWidth = 10;
+                
+                // Точки стрелки
+                const x1 = x;
+                const y1 = y;
+                const x2 = x - arrowLength * normDx - arrowWidth * normDy;
+                const y2 = y - arrowLength * normDy + arrowWidth * normDx;
+                const x3 = x - arrowLength * normDx + arrowWidth * normDy;
+                const y3 = y - arrowLength * normDy - arrowWidth * normDx;
+                
+                // Рисуем стрелку
+                this.ctx.beginPath();
+                this.ctx.moveTo(x1, y1);
+                this.ctx.lineTo(x2, y2);
+                this.ctx.lineTo(x3, y3);
+                this.ctx.closePath();
+                
+                this.ctx.fillStyle = '#FF5722'; // Яркий оранжевый цвет
+                this.ctx.fill();
+                
+                // Добавляем обводку для лучшей видимости
+                this.ctx.strokeStyle = '#FF5722';
+                this.ctx.lineWidth = 2;
+                this.ctx.stroke();
+            }
+            
+            handleMouseDown(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                this.lastMouseX = e.clientX - rect.left;
+                this.lastMouseY = e.clientY - rect.top;
+                this.isDragging = true;
+                this.canvas.style.cursor = 'grabbing';
+            }
+            
+            handleMouseMove(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+                
+                if (this.isDragging) {
+                    const dx = mouseX - this.lastMouseX;
+                    const dy = mouseY - this.lastMouseY;
+                    
+                    this.offsetX += dx;
+                    this.offsetY += dy;
+                    
+                    this.lastMouseX = mouseX;
+                    this.lastMouseY = mouseY;
+                    
+                    this.render();
+                }
+                
+                this.updateTooltip(e);
+            }
+            
+            handleMouseUp() {
+                this.isDragging = false;
+                this.canvas.style.cursor = 'default';
+            }
+            
+            handleWheel(e) {
+                e.preventDefault();
+                
+                const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+                const rect = this.canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+                
+                // Зум относительно положения курсора
+                const zoomX = (mouseX - this.offsetX) / this.scale;
+                const zoomY = (mouseY - this.offsetY) / this.scale;
+                
+                this.scale *= zoomFactor;
+                
+                // Ограничиваем масштаб
+                this.scale = Math.min(Math.max(0.1, this.scale), 5);
+                
+                // Корректируем смещение, чтобы точка под курсором оставалась на месте
+                this.offsetX = mouseX - zoomX * this.scale;
+                this.offsetY = mouseY - zoomY * this.scale;
+                
+                this.render();
+            }
+            
+            handleClick(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                const mouseX = (e.clientX - rect.left - this.offsetX) / this.scale;
+                const mouseY = (e.clientY - rect.top - this.offsetY) / this.scale;
+                
+                // Проверяем, попали ли в какой-либо узел (в обратном порядке для правильного z-index)
+                for (let i = this.allNodes.length - 1; i >= 0; i--) {
+                    const node = this.allNodes[i];
+                    if (node && 
+                        mouseX >= node.x && mouseX <= node.x + node.width &&
+                        mouseY >= node.y && mouseY <= node.y + node.height) {
+                        
+                        if (node.ref) {
+                            alert(node.ref);
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            showTooltip(e) {
+                this.tooltip.style.display = 'block';
+            }
+            
+            hideTooltip() {
+                this.tooltip.style.display = 'none';
+            }
+            
+            updateTooltip(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                const mouseX = (e.clientX - rect.left - this.offsetX) / this.scale;
+                const mouseY = (e.clientY - rect.top - this.offsetY) / this.scale;
+                
+                let foundNode = null;
+                
+                // Ищем узел под курсором
+                for (let i = this.allNodes.length - 1; i >= 0; i--) {
+                    const node = this.allNodes[i];
+                    if (node && 
+                        mouseX >= node.x && mouseX <= node.x + node.width &&
+                        mouseY >= node.y && mouseY <= node.y + node.height) {
+                        foundNode = node;
+                        break;
+                    }
+                }
+                
+                if (foundNode) {
+                    let tooltipText = '';
+                    
+                    if (foundNode instanceof Container) {
+                        tooltipText = `Контейнер: ${foundNode.title}\nISO: ${foundNode.isotype}\nВес: ${foundNode.weight}\nМесто: ${foundNode.place}`;
+                    } else if (foundNode instanceof Good) {
+                        tooltipText = `Груз: ${foundNode.title}\nВес: ${foundNode.weight}\nМесто: ${foundNode.place}`;
+                    }
+                    
+                    this.tooltip.innerHTML = tooltipText.replace(/\n/g, '<br>');
+                    this.tooltip.style.left = (e.clientX + 10) + 'px';
+                    this.tooltip.style.top = (e.clientY + 10) + 'px';
+                } else {
+                    this.tooltip.style.display = 'none';
+                }
+            }
+        }
+        
+        // Инициализация при загрузке страницы
+        document.addEventListener('DOMContentLoaded', function() {
+            const visualizer = new GraphVisualizer('graphCanvas');
+            
+            // Пример данных
+            const data = {
+                containers: [
+                    {
+                        id: "GUID1",
+                        title: "FESU7654321",
+                        isotype: "20DC",
+                        weight: "3100",
+                        place: "1",
+                        ref: "ссылка_контейнер_1",
+                        goods: [
+                            {id: "GUID2", title: "Чай вкусный", ref: "ссылка_чай_вкусный", weight: "31", place: "2"},
+                            {id: "GUID3", title: "Чай не вкусный", ref: "ссылка_чай_не_вкусный", weight: "32", place: "3"}
+                        ]
+                    },
+                    {
+                        id: "GUID4",
+                        title: "FESU7654322",
+                        isotype: "40HC",
+                        weight: "4200",
+                        place: "4",
+                        ref: "ссылка_контейнер_2",
+                        goods: []
+                    }
+                ],
+                goods: [
+                    {id: "GUID2_", title: "Чай вкусный (склад)", ref: "ссылка_чай_вкусный_склад", weight: "31", place: "5"},
+                    {id: "GUID3_", title: "Чай не вкусный (склад)", ref: "ссылка_чай_не_вкусный_склад", weight: "32", place: "6"}
+                ],
+                joins: [
+                    {from: "GUID2", to: "GUID4", text: "1/15"},
+                    {from: "GUID3", to: "GUID3_", text: "3/32"},
+                    {from: "GUID2", to: "GUID2_", text: "1/15"}
+                ]
+            };
+            
+            visualizer.setData(data);
+        });
+    </script>
+</body>
+</html>
